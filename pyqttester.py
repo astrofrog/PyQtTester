@@ -1,30 +1,34 @@
-#!/usr/bin/env python3
-
-import sys
-import os
-from os.path import dirname, join
+# https://raw.githubusercontent.com/astrofrog/PyQtTester/master/pyqttester.py
+#
 import re
-import signal
+import sys
 import pickle
 import logging
-import subprocess
-from functools import reduce, lru_cache
+from functools import reduce
 from collections import namedtuple
-from itertools import islice, count, repeat
+from itertools import islice, count
 from importlib import import_module
+
+from glue.external.qt import QtGui, QtCore
+from glue.external.qt.QtCore import Qt
 
 REAL_EXIT = sys.exit
 
-__version__ = '0.1.0'
+QT_KEYS = {value: 'Qt.' + key
+           for key, value in Qt.__dict__.items()
+           if key.startswith('Key_')}
+EVENT_TYPE = {v: k
+              for k, v in QtCore.QEvent.__dict__.items()
+              if isinstance(v, int)}
+
+PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
+
+QWidget = QtGui.QWidget
+qApp = QtGui.qApp
 
 SCENARIO_FORMAT_VERSION = 1
-X11_SHELL_SCRIPT = open(join(dirname(__file__), 'x11_subprocess.sh')).read()
 
 log = logging.getLogger(__name__)
-
-# Forward declared
-QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE = repeat(None, 7)
-
 
 def deepgetattr(obj, attr):
     """Recurses through an attribute chain to get the ultimate value."""
@@ -39,243 +43,6 @@ def nth(n, iterable, default=None):
 def typed_nth(n, target_type, iterable, default=None):
     """Return the n-th item of type from iterable"""
     return nth(n, (i for i in iterable if type(i) == target_type), default)
-
-
-def parse_args():
-    from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-    argparser = ArgumentParser(
-        description='A tool for testing PyQt GUI applications by recording '
-                    'and replaying scenarios.',
-        formatter_class=ArgumentDefaultsHelpFormatter,
-    )
-    argparser.add_argument(
-        '--verbose', '-v', action='count',
-        help='Print verbose information (use twice for debug).')
-    argparser.add_argument(
-        '--log', metavar='FILE',
-        help='Log program output.')
-
-    subparsers = argparser.add_subparsers(
-        title='Sub-commands', dest='_subcommand',
-        help='Use --help for additional sub-command arguments.')
-    parser_record = subparsers.add_parser(
-        'record',
-        formatter_class=ArgumentDefaultsHelpFormatter,
-        help='Record the events the user sends to the entry-point application '
-             'into the scenario file.')
-    parser_replay = subparsers.add_parser(
-        'replay',
-        formatter_class=ArgumentDefaultsHelpFormatter,
-        help='Replay the recorded scenario.')
-    parser_explain = subparsers.add_parser(
-        'explain',
-        formatter_class=ArgumentDefaultsHelpFormatter,
-        help='Explain in semi-human-readable form the events scenario contains.')
-
-    # TODO: default try to figure out Qt version by grepping entry-point
-    args, kwargs = (
-        ('--qt',),
-        dict(metavar='QT_VERSION', default='5', choices='45',
-             help='The version of PyQt to run the entry-point app with (4 or 5).'))
-    parser_record.add_argument(*args, **kwargs)
-    parser_replay.add_argument(*args, **kwargs)
-
-    args, kwargs = (
-        ('scenario',),
-        dict(metavar='SCENARIO',
-             help='The scenario file.'))
-    parser_record.add_argument(*args, **kwargs)
-    parser_replay.add_argument(*args, **kwargs)
-    parser_explain.add_argument(*args, **kwargs)
-
-    args, kwargs = (
-        ('main',),
-        dict(metavar='MODULE_PATH',
-             help='The application entry point (module.path.to:main function).'))
-    parser_record.add_argument(*args, **kwargs)
-    parser_replay.add_argument(*args, **kwargs)
-
-    args, kwargs = (
-        ('args',),
-        dict(metavar='ARGS',
-             nargs='*',
-             help='Additional arguments to pass to the app as sys.argv.'))
-    parser_record.add_argument(*args, **kwargs)
-    parser_replay.add_argument(*args, **kwargs)
-
-    parser_record.add_argument(
-        '--events-include', metavar='REGEX',
-        default=r'MouseEvent,KeyEvent,CloseEvent',  # TODO: add Drag, Focus, Hover ?
-        help='When recording, record only events that match the filter.')
-    parser_record.add_argument(
-        '--events-exclude', metavar='REGEX',
-        help="When recording, skip events that match the filter.")
-    parser_record.add_argument( # TODO
-        '--objects-include', metavar='REGEX',
-        help='When recording, record only events on objects that match the filter.')
-    parser_record.add_argument( # TODO
-        '--objects-exclude', metavar='REGEX',
-        help="When recording, skip events on objects that match the filter.")
-
-    parser_replay.add_argument(
-        '--x11', action='store_true',
-        help=('When replaying scenarios, do it in a new, headless X11 server. '
-              "This makes your app's stdout piped to stderr."))
-    parser_replay.add_argument(
-        '--x11-video', metavar='FILE', nargs='?', const=True,
-        help='Record the video of scenario playback into FILE (default: SCENARIO.mp4).')
-    parser_replay.add_argument( # TODO
-        '--coverage', action='store_true',
-        help='Run the coverage analysis simultaneously.')
-
-    args = argparser.parse_args()
-
-    def init_logging(verbose=0, log_file=None):
-        formatter = logging.Formatter('%(relativeCreated)d %(levelname)s: %(message)s')
-        for handler in (logging.StreamHandler(),
-                        log_file and logging.FileHandler(log_file, 'w', encoding='utf-8')):
-            if handler:
-                handler.setFormatter(formatter)
-                log.addHandler(handler)
-        log.setLevel(logging.WARNING - 10 * verbose)
-
-    init_logging(args.verbose or 0, args.log)
-    log.info('Program arguments: %s', args)
-
-    def _error(*args, **kwargs):
-        log.error(*args, **kwargs)
-        REAL_EXIT(1)
-
-    def _is_command_available(command):
-        try:
-            return subprocess.call(['which', command],
-                                   stdout=subprocess.DEVNULL) == 0
-        except OSError:
-            return False
-
-    def _check_main(args):
-
-        def _main(entry_point=args.main):
-            # Make the application believe it was run unpatched
-            sys.argv = [entry_point] + args.args
-            try:
-                module, main_func = entry_point.split(':')
-                log.debug('Importing module %s ...', module)
-                module = import_module(module)
-                real_main = deepgetattr(module, main_func)
-                if not callable(real_main):
-                    raise ValueError
-            except ValueError:
-                _error('MODULE_PATH must be like module.path.to:main function')
-            else:
-                log.info('Running %s', entry_point)
-                real_main()
-
-        args.main = _main
-
-    def _global_qt(args):
-        global QtGui, QtCore, QWidget, Qt, qApp, QT_KEYS, EVENT_TYPE
-        PyQt = 'PyQt' + str(args.qt)
-        QtGui = import_module(PyQt + '.QtGui')
-        QtCore = import_module(PyQt + '.QtCore')
-        Qt = QtCore.Qt
-        try:
-            QWidget = QtGui.QWidget
-            qApp = QtGui.qApp
-        except AttributeError:  # PyQt5
-            QtWidgets = import_module(PyQt + '.QtWidgets')
-            QWidget = QtWidgets.QWidget
-            qApp = QtWidgets.qApp
-        QT_KEYS = {value: 'Qt.' + key
-                   for key, value in Qt.__dict__.items()
-                   if key.startswith('Key_')}
-        EVENT_TYPE = {v: k
-                      for k, v in QtCore.QEvent.__dict__.items()
-                      if isinstance(v, int)}
-        # This is just a simple unit test. Put here because real Qt has only
-        # been made available above.
-        assert Resolver._qflags_key(Qt, Qt.LeftButton | Qt.RightButton) == \
-               'Qt.LeftButton|Qt.RightButton'
-
-    def check_explain(args):
-        try:
-            args.scenario = open(args.scenario, 'rb')
-        except (IOError, OSError) as e:
-            _error('explain %s: %s', args.scenario, e)
-
-    def check_record(args):
-        _check_main(args)
-        _global_qt(args)
-        try:
-            args.scenario = open(args.scenario, 'wb')
-        except (IOError, OSError) as e:
-            _error('record %s: %s', args.scenario, e)
-
-    def check_replay(args):
-        _check_main(args)
-        _global_qt(args)
-        try:
-            args.scenario = open(args.scenario, 'rb')
-        except (IOError, OSError) as e:
-            _error('replay %s: %s', args.scenario, e)
-        # TODO: https://coverage.readthedocs.org/en/coverage-4.0.2/api.html#api
-        #       https://nose.readthedocs.org/en/latest/plugins/cover.html#source
-        if args.x11_video:
-            if not _is_command_available('ffmpeg'):
-                _error('Recording video of X11 session (--x11-video) requires '
-                       'ffmpeg. Install package ffmpeg.')
-            if not args.x11:
-                log.warning('--x11-video implies --x11')
-                args.x11 = True
-            if args.x11_video is True:
-                args.x11_video = args.scenario.name + '.mp4'
-        if args.x11:
-            for xvfb in ('Xvfb', '/usr/X11/bin/Xvfb'):
-                if _is_command_available(xvfb):
-                    break
-            else:
-                _error('Headless X11 (--x11) requires working Xvfb. '
-                       'Install package xvfb (or XQuartz on a Macintosh).')
-            for xauth in ('xauth', '/usr/X11/bin/xauth'):
-                if _is_command_available(xauth):
-                    break
-            else:
-                _error('Headless X11 (--x11) requires working xauth. '
-                       'Install package xauth (or XQuartz on a Macintosh).')
-
-            log.info('Re-running head-less in Xvfb.')
-            # Prevent recursion
-            for arg in ('--x11', '--x11-video'):
-                if arg in sys.argv:
-                    sys.argv.remove(arg)
-
-            from random import randint
-            from hashlib import md5
-            env = os.environ.copy()
-            env.update(
-                VIDEO_FILE=args.x11_video,
-                RESOLUTION='1280x1024',
-                SCENARIO=args.scenario.name,
-                AUTH_FILE=os.path.join(os.path.expanduser('~'), '.Xauthority'),
-                XVFB=xvfb,
-                XAUTH=xauth,
-                MCOOKIE=md5(os.urandom(30)).hexdigest(),
-                DISPLAY=next(i for i in (randint(111, 10000) for _ in repeat(0))
-                             if not os.path.exists('/tmp/.X{}-lock'.format(i))),
-                ARGV=' '.join(sys.argv))
-            REAL_EXIT(subprocess.call(X11_SHELL_SCRIPT,
-                                      shell=True,
-                                      stdout=sys.stderr,
-                                      env=env))
-
-    try:
-        dict(record=check_record,
-             replay=check_replay,
-             explain=check_explain)[args._subcommand](args)
-    except KeyError:
-        return REAL_EXIT(argparser.format_help())
-    return args
-
 
 PathElement = namedtuple('PathElement', ('index', 'type', 'name'))
 
@@ -469,14 +236,12 @@ class Resolver:
             return eval('QtCore.' + event_str)
 
     @staticmethod
-    @lru_cache()
     def serialize_type(type_obj):
         """Return fully-qualified name of type, or '' if translation not reversible"""
         type_str = type_obj.__module__ + ':' + type_obj.__qualname__
         return type_str if '.<locals>.' not in type_str else ''
 
     @staticmethod
-    @lru_cache()
     def deserialize_type(type_str):
         """Return type object that corresponds to type_str"""
         module, qualname = type_str.split(':')
@@ -490,25 +255,28 @@ class Resolver:
         of widget, or similar.
         """
         if widget is None:
-            yield from qApp.topLevelWidgets()
+            for item in qApp.topLevelWidgets():
+                yield qApp.topLevelWidgets()
 
         if isinstance(widget, QtGui.QSplitter):
-            yield from (widget.widget(i) for i in range(widget.count()))
-            yield from (widget.handle(i) for i in range(widget.count()))
+            for i in range(widget.count()):
+                yield widget.widget(i)
+                yield widget.handle(i)
 
         layout = hasattr(widget, 'layout') and widget.layout()
         if layout:
-            yield from (layout.itemAt(i).widget()
-                        for i in range(layout.count()))
+            for i in range(layout.count()):
+                yield layout.itemAt(i).widget()
 
         if hasattr(widget, 'children'):
-            yield from widget.children()
+            for child in widget.children():
+                yield child
 
         # If widget can't be found in the hierarchy by Qt means,
         # try Python object attributes
-        yield from (getattr(widget, attr)
-                    for attr in dir(widget)
-                    if not attr.startswith('__') and attr.endswith('__'))
+        for attr in dir(widget):
+            if not attr.startswith('__') and attr.endswith('__'):
+                yield getattr(widget, attr)
 
     @classmethod
     def serialize_object(cls, obj):
@@ -615,12 +383,14 @@ class Resolver:
 
 
 class _EventFilter:
+
     @staticmethod
     def wait_for_app_start(method):
         is_started = False
 
         def wrapper(self, obj, event):
-            nonlocal is_started
+
+            global is_started
             if not is_started:
                 log.debug('Caught %s (%s) event but app not yet fully "started"',
                           EVENT_TYPE.get(event.type(),
@@ -642,7 +412,8 @@ class _EventFilter:
         pass
 
 
-class EventRecorder(_EventFilter):
+class EventRecorder(_EventFilter, QtCore.QObject):
+
     def __init__(self, file, events_include, events_exclude):
         super().__init__()
         self.file = file
@@ -703,7 +474,8 @@ class EventRecorder(_EventFilter):
         log.debug(self.events)
 
 
-class EventReplayer(_EventFilter):
+class EventReplayer(_EventFilter, QtCore.QObject):
+
     def __init__(self, file):
         super().__init__()
         # Replay events X ms after the last event
@@ -750,100 +522,3 @@ class EventReplayer(_EventFilter):
             log.warning("Application didn't manage to replay all events. "
                         "This may indicate failure. But not necessarily. :|")
             log.info("The remaining events are: %s", remaining_events)
-
-
-class EventExplainer:
-    def __init__(self, file):
-        self._events = pickle.load(file)
-        self.events = iter(self._events)
-        format_version = next(self.events)
-        obj_cache = next(self.events) if format_version > 0 else None
-        self.resolver = Resolver(obj_cache)
-
-    def run(self):
-        for i, event in enumerate(self.events):
-            self.resolver.print_state(i, *event)
-
-
-def EventFilter(klass, *args):
-    """
-    Return an instance of type'd filter with closure over correct
-    (PyQt4's or PyQt5's) version of QtCore.QObject.
-    """
-    class EventFilter(klass, QtCore.QObject):
-        """
-        This class is a wrapper around above EventRecorder / EventReplayer.
-        Qt requires that the object that filters events with eventFilter() is
-        (also) a QObject.
-        """
-        def eventFilter(self, obj, event):
-            return super().eventFilter(obj, event)
-
-    return EventFilter(*args)
-
-
-def main():
-    args = parse_args()
-
-    if args._subcommand == 'explain':
-        explainer = EventExplainer(args.scenario)
-        explainer.run()
-        return 0
-
-    event_filters = []
-    if args._subcommand == 'record':
-        recorder = EventFilter(EventRecorder,
-                               args.scenario,
-                               args.events_include,
-                               args.events_exclude)
-        event_filters.append(recorder)
-    if args._subcommand == 'replay':
-        replayer = EventFilter(EventReplayer, args.scenario)
-        event_filters.append(replayer)
-
-    assert event_filters
-
-    # Patch QApplication to filter all events through EventRecorder / EventReplayer
-    class QApplication(QtGui.QApplication):
-        def __init__(self, *args, **kwargs):
-            # Before constructing the application, prevent the application of
-            # any custom, desktop environment-dependent styles and settings.
-            # We can only reproduce scenarios if everyone is running them
-            # the same.
-            QApplication.setDesktopSettingsAware(False)
-            super().__init__(*args, **kwargs)
-            for event_filter in event_filters:
-                log.debug('Installing event filter: %s',
-                          type(event_filter).mro()[1].__name__)
-                self.installEventFilter(event_filter)
-    QtGui.QApplication = QApplication
-
-    # Prevent exit with zero status from inside the app. We need to exit from this app.
-    def logging_exit(status=0):
-        log.warning('Prevented call to sys.exit() with status: %s', str(status))
-        if status != 0:
-            log.warning('But the exit status was non-zero, so quitting')
-            REAL_EXIT(status)
-    sys.exit = logging_exit
-
-    # Qt doesn't raise exceptions out of its event loop; but this works
-    def excepthook(etype, value, tback):
-        import traceback
-        log.error('Unhandled exception encountered')
-        traceback.print_exception(etype, value, tback)
-        REAL_EXIT(2)
-    sys.excepthook = excepthook
-
-    # Allow termination with Ctrl+C
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    # Execute the app
-    args.main()
-
-    log.info('Application exited successfully. Congrats!')
-
-    for event_filter in event_filters:
-        event_filter.close()
-    return 0
-
-if __name__ == '__main__':
-    REAL_EXIT(main())
